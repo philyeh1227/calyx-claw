@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ssh:*)",
+      "Bash(sleep:*)",
+      "WebFetch(domain:speakerdeck.com)",
+      "Bash(ping:*)",
+      "WebSearch",
+      "WebFetch(domain:docs.openclaw.ai)",
+      "WebFetch(domain:github.com)"
+    ]
+  }
+}
