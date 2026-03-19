@@ -1,0 +1,15 @@
+[Unit]
+Description=Gemini CLI Proxy (OpenClaw backend)
+After=network.target
+
+[Service]
+Type=simple
+User=calyxclaw-one
+ExecStart=/usr/bin/python3 /home/calyxclaw-one/gemini_cli_proxy.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

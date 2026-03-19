@@ -7,7 +7,9 @@
       "Bash(ping:*)",
       "WebSearch",
       "WebFetch(domain:docs.openclaw.ai)",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "Bash(scp:*)",
+      "Bash(powershell -Command \"Get-Disk | Select-Object Number, FriendlyName, Size, PartitionStyle | Format-Table -AutoSize\")"
     ]
   }
 }
