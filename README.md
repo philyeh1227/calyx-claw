@@ -8,25 +8,72 @@ User: calyxclaw-one
 
 ---
 
-## detect.py — YOLOv8 Hailo Object Detection
+## detect.py — YOLOv8 Hailo Object Detection + Camera Capture API
 
-Entry point: `/home/calyxclaw-one/hailo_yolov8/detect.py`
+Entry point: `~/detect.py` on RPi5
+
+Runs YOLOv8s on the Hailo-8L NPU with Picamera2 (1920x1080 main + 640x640 lores).
+Keeps the latest full-resolution frame in a RAM buffer and exposes an HTTP capture API on port 8081.
 
 ```bash
-# 背景啟動
-nohup python3 /home/calyxclaw-one/hailo_yolov8/detect.py > /tmp/detect_console.log 2>&1 &
+# Start (background)
+nohup python3 ~/detect.py > /tmp/detect.log 2>&1 &
 
-# 確認運行
-pgrep -a -f detect.py
+# Check
+pgrep -af detect.py
+tail -f /tmp/detect.log
 
-# 查看 console log
-tail -f /tmp/detect_console.log
+# Detection status (updated every 60s)
+cat ~/hailo_yolov8/status.txt
 
-# 查看偵測結果（每 60 秒更新）
-cat /home/calyxclaw-one/hailo_yolov8/status.txt
-
-# 停止
+# Stop
 pkill -f detect.py
+
+# Capture API health check
+curl http://127.0.0.1:8081/health
+
+# Trigger a photo capture
+curl -s -X POST http://127.0.0.1:8081/capture | python3 -m json.tool
+```
+
+## capture_photo.py — Photo Capture Client + Discord Upload
+
+Thin client for detect.py's capture API. Captures a photo from the RAM frame buffer and optionally uploads to Discord.
+
+```bash
+# Basic capture (returns JSON with file path)
+python3 ~/capture_photo.py --json
+
+# Capture and upload to Discord (auto-detects channel from /tmp/openclaw_channel_id)
+python3 ~/capture_photo.py --discord --json
+
+# Capture with custom message
+python3 ~/capture_photo.py --discord --message "Hello!" --json
+
+# Capture and upload to specific Discord channel
+python3 ~/capture_photo.py --discord --channel 1485611366873174189 --json
+
+# Capture and save a copy to a folder
+python3 ~/capture_photo.py --copy-to ~/photos/ --json
+```
+
+Channel ID priority: `--channel` arg > `/tmp/openclaw_channel_id` file > `DISCORD_CHANNEL_ID` env var > hardcoded default.
+
+### Discord photo via OpenClaw
+
+In Discord, @mention the bot and say "拍照":
+
+```
+@clawclaw 拍照
+```
+
+The OpenClaw agent uses the `exec` tool to run `capture_photo.py`. The proxy automatically extracts the Discord channel ID from conversation metadata and writes it to `/tmp/openclaw_channel_id`, so photos are sent to the correct channel.
+
+### Deploy
+
+```bash
+scp detect.py calyxclaw-one@100.105.147.105:~/detect.py
+scp capture_photo.py calyxclaw-one@100.105.147.105:~/capture_photo.py
 ```
 
 ---
@@ -162,7 +209,7 @@ openclaw config set <key> <value>   # 寫入設定
 
 ### 模型設定（目前）
 
-目前使用 `gemini-3.1-flash-lite`，設定分兩處，均為永久生效，開機不需重新設定：
+目前使用 `gemini-3.1-flash-lite-preview`（REST API 名稱），設定分兩處，均為永久生效，開機不需重新設定：
 
 **OpenClaw** (`~/.openclaw/openclaw.json`)：
 ```bash
@@ -171,7 +218,7 @@ import json
 path = '/home/calyxclaw-one/.openclaw/openclaw.json'
 with open(path) as f:
     d = json.load(f)
-d['agents']['defaults']['model']['primary'] = 'google/gemini-3.1-flash-lite'
+d['agents']['defaults']['model']['primary'] = 'google/gemini-3.1-flash-lite-preview'
 with open(path, 'w') as f:
     json.dump(d, f, indent=2)
 "
@@ -184,13 +231,62 @@ import json
 path = '/home/calyxclaw-one/.gemini/settings.json'
 with open(path) as f:
     d = json.load(f)
-d['selectedModel'] = 'gemini-3.1-flash-lite'
+d['selectedModel'] = 'gemini-3.1-flash-lite-preview'
 with open(path, 'w') as f:
     json.dump(d, f, indent=2)
 "
 ```
 
-切換模型時兩處都要更新。
+切換模型時兩處都要更新。REST API 模型名稱可能與 CLI 別名不同（如 `gemini-3.1-flash-lite` vs `gemini-3.1-flash-lite-preview`），用 ListModels API 確認。
+
+### 工具權限設定
+
+OpenClaw 預設停用 `exec`（shell 執行）工具。需在 `~/.openclaw/openclaw.json` 中明確啟用：
+
+```bash
+python3 -c "
+import json
+path = '/home/calyxclaw-one/.openclaw/openclaw.json'
+with open(path) as f:
+    d = json.load(f)
+d['tools'] = {
+    'profile': 'coding',
+    'deny': [],
+    'exec': {
+        'host': 'gateway',
+        'security': 'full',
+        'ask': 'off'
+    }
+}
+with open(path, 'w') as f:
+    json.dump(d, f, indent=2)
+"
+systemctl --user restart openclaw-gateway
+```
+
+| 欄位 | 說明 |
+|------|------|
+| `profile` | 工具集合：`coding` 包含 read/edit/write/exec 等 17 個工具 |
+| `deny` | 拒絕清單，空陣列 = 不額外拒絕任何工具 |
+| `exec.host` | 執行主機：`gateway` = 在 gateway 本機執行 |
+| `exec.security` | 安全模式：`full` = 無沙箱限制，`sandbox` = 受限環境 |
+| `exec.ask` | 執行前確認：`off` = 不詢問，`always` = 每次詢問 |
+
+**注意**：`security: "full"` 允許 agent 執行任意 shell 指令，僅適用於受信任環境（如 Tailscale 私網內）。
+
+### Skills
+
+OpenClaw skills 放在 `~/.openclaw/skills/<name>/SKILL.md`，會自動注入 agent 的 system prompt。
+
+```bash
+# 查看已安裝的 skills
+ls ~/.openclaw/skills/
+
+# 目前已安裝
+# capture_photo — 教 agent 使用 exec 工具執行 capture_photo.py 拍照
+```
+
+新增 skill：建立 `~/.openclaw/skills/<name>/SKILL.md`，重啟 gateway 生效。
 
 ---
 
@@ -211,16 +307,16 @@ df -h /
 
 ---
 
-## Gemini CLI Proxy
+## Gemini REST Proxy
 
-Routes OpenClaw's Gemini REST API calls through the local `gemini` CLI tool instead
-of hitting the Gemini REST API directly. Useful when the REST API key has quota issues
-but the CLI (authenticated separately) works fine.
+Reverse proxy that forwards complete Gemini REST API requests from OpenClaw to
+`https://generativelanguage.googleapis.com`, preserving tools, function calling,
+system instructions, and all other fields.
 
 ### Architecture
 
 ```
-OpenClaw → http://127.0.0.1:8080 → gemini_cli_proxy.py → /usr/bin/gemini -m <model> -p "<prompt>"
+OpenClaw → http://127.0.0.1:8080 → gemini_cli_proxy.py → Gemini REST API → response back
 ```
 
 ### Files
@@ -228,89 +324,30 @@ OpenClaw → http://127.0.0.1:8080 → gemini_cli_proxy.py → /usr/bin/gemini -
 | File | Location |
 |------|----------|
 | `gemini_cli_proxy.py` | `~/gemini_cli_proxy.py` on RPi5 |
-| `gemini-cli-proxy.service` | `/etc/systemd/system/gemini-cli-proxy.service` (optional) |
+| `gemini-cli-proxy.service` | `/etc/systemd/system/gemini-cli-proxy.service` |
 
 ### How it works
 
-1. OpenClaw sends a POST to `/models/<model>:generateContent` or `/models/<model>:streamGenerateContent`
-2. The proxy extracts the model name from the URL path and all `text` parts from the request body
-3. It calls `gemini -m <model> -p "<prompt>"` as a subprocess with `NO_COLOR=1 TERM=dumb`
-4. ANSI escape codes are stripped from the CLI output
-5. For `streamGenerateContent`: response is wrapped in SSE format (two chunks: content + `finishReason: STOP`)
-6. For `generateContent`: response is wrapped in standard Gemini JSON format
+1. OpenClaw sends a POST to `/models/<model>:generateContent` or `:streamGenerateContent`
+2. Proxy prepends `/v1beta` prefix if missing, appends `?key=<GEMINI_API_KEY>` to the URL
+3. Complete request body is forwarded as-is (tools, function declarations, system instructions all preserved)
+4. For `streamGenerateContent`: response chunks are streamed back via chunked transfer encoding
+5. For `generateContent`: full JSON response is forwarded
+6. Proxy extracts Discord channel ID from conversation metadata → writes to `/tmp/openclaw_channel_id`
+7. Logs include tool names, functionCall presence, and response summaries
 
-### OpenClaw config (`~/.openclaw/openclaw.json`)
-
-```json
-{
-  "models": {
-    "providers": {
-      "google": {
-        "baseUrl": "http://127.0.0.1:8080",
-        "models": []
-      }
-    }
-  },
-  "agents": {
-    "defaults": {
-      "model": {
-        "primary": "google/gemini-3.1-flash-lite"
-      }
-    }
-  }
-}
-```
-
-Edit with:
-```bash
-python3 -c "
-import json
-path = '/home/calyxclaw-one/.openclaw/openclaw.json'
-with open(path) as f:
-    d = json.load(f)
-d['models']['providers']['google']['baseUrl'] = 'http://127.0.0.1:8080'
-d['models']['providers']['google']['models'] = []
-d['agents']['defaults']['model']['primary'] = 'google/gemini-3.1-flash-lite'
-with open(path, 'w') as f:
-    json.dump(d, f, indent=2)
-"
-```
-
-### API key setup
-
-The proxy reads `~/.env` at startup to load `GEMINI_API_KEY`:
-
-```bash
-# Copy key from OpenClaw env
-grep GEMINI_API_KEY /etc/openclaw/openclaw.env >> ~/.env
-```
-
-### Deploy & run
+### Deploy & manage
 
 ```bash
 # Deploy
 scp gemini_cli_proxy.py calyxclaw-one@100.105.147.105:~/gemini_cli_proxy.py
 
-# Start (manual, background)
-nohup python3 ~/gemini_cli_proxy.py > /tmp/proxy.log 2>&1 & disown
+# Restart systemd service
+sudo systemctl restart gemini-cli-proxy
 
-# Check
-pgrep -a python3 | grep proxy
-tail -f /tmp/proxy.log
-
-# Stop
-pkill -f gemini_cli_proxy.py
-```
-
-### Install as systemd service (persistent across reboots)
-
-```bash
-scp gemini-cli-proxy.service calyxclaw-one@100.105.147.105:~/
-ssh calyxclaw-one@100.105.147.105 "sudo mv ~/gemini-cli-proxy.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now gemini-cli-proxy"
-
-# Status
+# Status & logs
 sudo systemctl status gemini-cli-proxy
-journalctl -u gemini-cli-proxy -n 50 --no-pager
+sudo journalctl -u gemini-cli-proxy -n 50 --no-pager
 ```
 
 ### Test
@@ -319,23 +356,29 @@ journalctl -u gemini-cli-proxy -n 50 --no-pager
 # Health check
 curl http://127.0.0.1:8080/health
 
-# Streaming (what OpenClaw uses)
-curl -s -X POST 'http://127.0.0.1:8080/models/gemini-3.1-flash-lite:streamGenerateContent?alt=sse' \
-  -H 'Content-Type: application/json' \
-  -d '{"contents":[{"role":"user","parts":[{"text":"say hi"}]}]}'
-
-# Via OpenClaw CLI
-openclaw agent --local --agent main -m "say hello" --json
+# Test with function calling
+python3 -c "
+import urllib.request, json
+body = json.dumps({
+    'contents': [{'role': 'user', 'parts': [{'text': 'Say hello'}]}],
+    'tools': [{'functionDeclarations': [{'name': 'test', 'description': 'test', 'parameters': {'type': 'object', 'properties': {}}}]}]
+}).encode()
+req = urllib.request.Request('http://127.0.0.1:8080/v1beta/models/gemini-3.1-flash-lite-preview:generateContent', data=body, headers={'Content-Type': 'application/json'})
+resp = urllib.request.urlopen(req, timeout=30)
+print(json.dumps(json.loads(resp.read()), indent=2))
+"
 ```
 
 ### Troubleshooting
 
 | Symptom | Fix |
 |---------|-----|
-| Port 8080 already in use | `pkill -f gemini_cli_proxy.py` then restart |
+| Port 8080 already in use | `sudo systemctl restart gemini-cli-proxy` |
 | `GEMINI_API_KEY not set` | Check `~/.env` contains `GEMINI_API_KEY=...` |
-| Garbled ANSI in response | Already handled: `NO_COLOR=1 TERM=dumb` + regex strip |
-| `TerminalQuotaError` | Daily quota exhausted — wait until next day |
+| `Unexpected end of JSON input` | Proxy ensures valid JSON on errors; check proxy logs |
+| 404 on model name | REST API names differ from CLI — use ListModels API to verify |
+| 429 quota exceeded | Free tier limit — wait for reset or switch to paid tier |
+| Model ignores tools | Check proxy log for `tool names:` — verify tools are being forwarded |
 | OpenClaw retrying with old error context | Delete stale session: `rm ~/.openclaw/agents/main/sessions/<id>.jsonl` |
 
 ---
@@ -413,8 +456,13 @@ sudo nano /etc/openclaw/openclaw.env
 
 - OpenClaw gateway 只綁定在 Tailscale IP，不對公網開放
 - Gateway 密碼存放在 systemd service env（`OPENCLAW_GATEWAY_PASSWORD`），不在 config 檔
-- AI 模型：Gemini 3.1 Flash Lite（透過 gemini-cli-proxy 路由）
+- AI 模型：Gemini 3.1 Flash Lite Preview（透過 gemini REST proxy 路由）
 - Discord bot `@clawclaw` 已串接，@mention 觸發，slash commands 已對 user `876772650872090657` 開放
+- Discord channels: `1483838752106479666`, `1485611366873174189`
 - Hailo NPU 由 detect.py 獨立使用，與 OpenClaw 無資源衝突
+- detect.py 同時提供物件偵測和 camera capture API（port 8081）
+- Picamera2 RGB888 格式在記憶體中實際為 BGR，detect.py 在存 JPEG 前會做 `[:, :, ::-1]` 轉換
+- OpenClaw 工具設定：`profile: "coding"`, `exec.security: "full"`, `exec.ask: "off"`
+- OpenClaw skill `capture_photo` 教導 agent 使用 exec tool 執行 capture_photo.py
 - Dashboard 需 HTTPS secure context，建議用 SSH tunnel 或 `openclaw tui`
 - SD 卡鏡像已備份至外接 SSD（`/RPi5-Clone/rpi5-clone.img`，117GB，2026-03-19）

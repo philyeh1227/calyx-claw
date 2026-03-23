@@ -9,7 +9,8 @@
       "WebFetch(domain:docs.openclaw.ai)",
       "WebFetch(domain:github.com)",
       "Bash(scp:*)",
-      "Bash(powershell -Command \"Get-Disk | Select-Object Number, FriendlyName, Size, PartitionStyle | Format-Table -AutoSize\")"
+      "Bash(powershell -Command \"Get-Disk | Select-Object Number, FriendlyName, Size, PartitionStyle | Format-Table -AutoSize\")",
+      "Bash(ssh calyxclaw-one@100.105.147.105 \"ls /dev/hailo* 2>&1 && lsmod | grep hailo && echo ''---OK---''\")"
     ]
   }
 }

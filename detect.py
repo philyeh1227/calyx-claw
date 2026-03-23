@@ -2,19 +2,27 @@
 """
 hailo_yolov8/detect.py
 
-Extends the rpicam YOLOv8 Hailo-8L example.
-- Captures detections in-memory
-- Filters objects that persist for 3+ seconds
-- Overwrites status.txt every 60 seconds (SD-card-friendly)
+YOLOv8 Hailo-8L object detection with live frame buffer and capture API.
+
+- Captures frames from Picamera2 (1920x1080 main + model-size lores)
+- Runs YOLOv8 detection on Hailo NPU via lores stream
+- Keeps latest full-resolution frame in RAM buffer (no disk writes)
+- Exposes HTTP API on port 8081 for on-demand photo capture
+- Writes detection status to status.txt every 60 seconds
 """
 
+import json
+import os
+import sys
 import time
 import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import numpy as np
 import libcamera
 from picamera2 import Picamera2
 from picamera2.devices import Hailo
+from PIL import Image
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -25,6 +33,11 @@ CONFIDENCE_THRESHOLD = 0.4
 PERSIST_SECONDS = 3.0       # object must appear continuously for this long
 WRITE_INTERVAL = 60         # seconds between status.txt overwrites
 CAMERA_ROTATION = 180
+
+CAPTURE_SERVER_HOST = "127.0.0.1"
+CAPTURE_SERVER_PORT = 8081
+CAPTURE_DIR = "/tmp"
+CAPTURE_QUALITY = 85
 
 COCO_CLASSES = [
     "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
@@ -107,6 +120,135 @@ class DetectionTracker:
 
 
 # ---------------------------------------------------------------------------
+# Frame buffer (RAM only, no disk I/O)
+# ---------------------------------------------------------------------------
+class FrameBuffer:
+    """Thread-safe buffer holding the latest full-resolution camera frame."""
+
+    def __init__(self):
+        self._frame = None      # numpy array (RGB888, 1920x1080)
+        self._lock = threading.Lock()
+        self._timestamp = 0.0
+
+    def update(self, frame: np.ndarray):
+        """Store a new frame (caller must pass a copy, not a DMA view)."""
+        with self._lock:
+            self._frame = frame
+            self._timestamp = time.time()
+
+    @property
+    def available(self) -> bool:
+        with self._lock:
+            return self._frame is not None
+
+    def save_jpeg(self, output_path: str, quality: int = CAPTURE_QUALITY) -> dict:
+        """Save the buffered frame to a JPEG file.
+
+        Returns metadata dict with path, timestamp, and file size.
+        Raises RuntimeError if no frame is buffered yet.
+        """
+        with self._lock:
+            if self._frame is None:
+                raise RuntimeError("no frame available yet (camera still starting?)")
+            frame = self._frame.copy()
+            ts = self._timestamp
+
+        # Picamera2 RGB888 is actually BGR in memory; convert to RGB for PIL
+        img = Image.fromarray(frame[:, :, ::-1])
+        img.save(output_path, "JPEG", quality=quality)
+
+        return {
+            "path": output_path,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)),
+            "size_bytes": os.path.getsize(output_path),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Capture HTTP API
+# ---------------------------------------------------------------------------
+class CaptureHandler(BaseHTTPRequestHandler):
+    """Lightweight HTTP handler for on-demand photo capture.
+
+    Endpoints:
+        GET  /health   -> {"status": "ok", ...}
+        POST /capture  -> save buffered frame to JPEG, return file metadata
+            Optional JSON body: {"path": "/custom/path.jpg", "quality": 90}
+    """
+
+    frame_buffer: FrameBuffer = None  # set before server starts
+
+    def log_message(self, fmt, *args):
+        print("[capture-api] {}".format(fmt % args), file=sys.stderr, flush=True)
+
+    def _send_json(self, status: int, data: dict):
+        body = json.dumps(data).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/health":
+            self._send_json(200, {
+                "status": "ok",
+                "service": "detect-capture",
+                "frame_ready": self.frame_buffer.available if self.frame_buffer else False,
+            })
+        else:
+            self._send_json(404, {"error": "not found"})
+
+    def do_POST(self):
+        if not self.path.startswith("/capture"):
+            self._send_json(404, {"error": "not found"})
+            return
+
+        if self.frame_buffer is None:
+            self._send_json(503, {"error": "frame buffer not initialized"})
+            return
+
+        # Parse optional JSON body
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = {}
+        if content_length > 0:
+            try:
+                body = json.loads(self.rfile.read(content_length))
+            except (json.JSONDecodeError, ValueError) as e:
+                self._send_json(400, {"error": "invalid JSON: {}".format(e)})
+                return
+
+        default_path = os.path.join(
+            CAPTURE_DIR, "claw_capture_{}.jpg".format(int(time.time())),
+        )
+        output_path = body.get("path", default_path)
+        quality = body.get("quality", CAPTURE_QUALITY)
+
+        try:
+            result = self.frame_buffer.save_jpeg(output_path, quality)
+            self._send_json(200, result)
+        except RuntimeError as e:
+            self._send_json(503, {"error": str(e)})
+        except Exception as e:
+            self._send_json(500, {"error": str(e)})
+
+
+def start_capture_server(frame_buffer: FrameBuffer) -> HTTPServer:
+    """Start the capture API server in a daemon thread."""
+    CaptureHandler.frame_buffer = frame_buffer
+    server = HTTPServer((CAPTURE_SERVER_HOST, CAPTURE_SERVER_PORT), CaptureHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(
+        "[capture-api] listening on {}:{}".format(
+            CAPTURE_SERVER_HOST, CAPTURE_SERVER_PORT,
+        ),
+        flush=True,
+    )
+    return server
+
+
+# ---------------------------------------------------------------------------
 # Status writer
 # ---------------------------------------------------------------------------
 def write_status(tracker, stop_event):
@@ -165,6 +307,7 @@ def parse_detections(raw_output):
 # ---------------------------------------------------------------------------
 def main():
     tracker = DetectionTracker(persist_seconds=PERSIST_SECONDS)
+    frame_buffer = FrameBuffer()
     stop_event = threading.Event()
 
     writer_thread = threading.Thread(
@@ -174,13 +317,15 @@ def main():
     )
     writer_thread.start()
 
+    capture_server = start_capture_server(frame_buffer)
+
     with Hailo(HEF_PATH) as hailo:
         model_h, model_w, _ = hailo.get_input_shape()
 
         with Picamera2() as picam2:
             transform = libcamera.Transform(rotation=CAMERA_ROTATION)
             main_config = picam2.create_preview_configuration(
-                main={"size": (1920, 1080)},
+                main={"size": (1920, 1080), "format": "RGB888"},
                 lores={"size": (model_w, model_h), "format": "RGB888"},
                 transform=transform,
                 buffer_count=4,
@@ -190,11 +335,23 @@ def main():
             print("Camera started. Model input: {}x{}".format(model_w, model_h))
             print("Rotation: {} degrees".format(CAMERA_ROTATION))
             print("Logging objects present for {}s+ to {}".format(PERSIST_SECONDS, STATUS_PATH))
+            print("Frame buffer: enabled (capture API on port {})".format(CAPTURE_SERVER_PORT))
             print("Press Ctrl+C to stop.")
 
             try:
                 while True:
-                    lores_frame = picam2.capture_array("lores")
+                    # Grab both streams from the same capture request
+                    request = picam2.capture_request()
+                    try:
+                        lores_frame = request.make_array("lores").copy()
+                        main_frame = request.make_array("main").copy()
+                    finally:
+                        request.release()
+
+                    # Update RAM frame buffer (always fresh, no disk I/O)
+                    frame_buffer.update(main_frame)
+
+                    # Run detection on lores stream
                     raw_output = hailo.run(lores_frame)
                     detections = parse_detections(raw_output)
                     tracker.update(detections)
@@ -210,6 +367,7 @@ def main():
                 print("\nStopping...")
             finally:
                 stop_event.set()
+                capture_server.shutdown()
                 writer_thread.join(timeout=5)
 
 

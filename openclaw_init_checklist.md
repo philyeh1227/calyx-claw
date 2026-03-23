@@ -1,6 +1,3 @@
-下面是可直接存成 `openclaw_init_checklist.md` 的內容。內容依照 OpenClaw 在 Raspberry Pi 上需要 Node 22+、可用 daemon/systemd 常駐，以及 Tailscale tags/ACL 與 Gemini rate-limit retry 的實務要點整理而成。 [sunfounder](https://www.sunfounder.com/blogs/news/how-to-run-openclaw-on-raspberry-pi-a-practical-setup-guide)
-
-```md
 # OpenClaw Init Checklist
 
 適用場景：Raspberry Pi 5 + Tailscale + OpenClaw + Gemini Flash 3  
@@ -362,8 +359,3 @@ free -h
 - ACL: 僅允許你的裝置/帳號
 - Model: Gemini Flash 3
 - Safety: timeout + retry + backoff + destructive confirm
-```
-
-這份 `openclaw_init_checklist.md` 已經可以直接存檔使用，裡面的 OpenClaw 安裝、Node 版本、systemd、Tailscale tags/ACL 與 Gemini retry 原則都對應到目前文件與實務建議。 [tailscale](https://tailscale.com/docs/features/tags)
-
-我也可以接著幫你產出兩個可直接貼上的檔案版本：`openclaw.service` 和 `tailscale_acl.json`。
